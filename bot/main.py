@@ -3,6 +3,7 @@ import os
 
 from dotenv import load_dotenv
 
+from huggingface_helper import HuggingFaceClient
 from openai_helper import OpenAIHelper, default_max_tokens
 from telegram_bot import ChatGPTTelegramBot
 
@@ -45,6 +46,11 @@ def main():
         'bot_language': os.environ.get('BOT_LANGUAGE', 'en'),
     }
 
+    huggingface_config = {
+        'token': os.environ.get('HUGGINGFACE_TOKEN', None),
+        'text_to_image_model_id': os.environ.get('HUGGINGFACE_MODEL_TEXT_TO_IMAGE', 'stabilityai/stable-diffusion-2-base'),
+    }
+
     # log deprecation warning for old budget variable names
     # old variables are caught in the telegram_config definition for now
     # remove support for old budget names at some point in the future
@@ -78,7 +84,10 @@ def main():
 
     # Setup and run ChatGPT and Telegram bot
     openai_helper = OpenAIHelper(config=openai_config)
-    telegram_bot = ChatGPTTelegramBot(config=telegram_config, openai=openai_helper)
+    huggingface_helper = HuggingFaceClient(**huggingface_config)
+    telegram_bot = ChatGPTTelegramBot(config=telegram_config,
+                                      openai=openai_helper,
+                                      huggingface=huggingface_helper)
     telegram_bot.run()
 
 

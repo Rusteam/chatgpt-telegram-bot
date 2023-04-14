@@ -3,7 +3,6 @@ import logging
 import os
 import itertools
 import asyncio
-import json
 
 import telegram
 from uuid import uuid4
@@ -14,6 +13,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
     filters, InlineQueryHandler, Application, CallbackContext
 
 from pydub import AudioSegment
+
+from huggingface_helper import HuggingFaceClient
 from openai_helper import OpenAIHelper, localized_text
 from usage_tracker import UsageTracker
 
@@ -41,7 +42,7 @@ class ChatGPTTelegramBot:
             "all-time":"cost_all_time"
         }
 
-    def __init__(self, config: dict, openai: OpenAIHelper):
+    def __init__(self, config: dict, openai: OpenAIHelper, huggingface: HuggingFaceClient):
         """
         Initializes the bot with the given configuration and GPT bot object.
         :param config: A dictionary containing the bot configuration
@@ -49,6 +50,7 @@ class ChatGPTTelegramBot:
         """
         self.config = config
         self.openai = openai
+        self.huggingface = huggingface
         bot_language = self.config['bot_language']
         self.commands = [
             BotCommand(command='help', description=localized_text('help_description', bot_language)),
@@ -189,17 +191,27 @@ class ChatGPTTelegramBot:
         self.openai.reset_chat_history(chat_id=chat_id, content=reset_content)
         await context.bot.send_message(chat_id=chat_id, text=localized_text('reset_done', self.config['bot_language']))
 
-    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Generates an image for the given prompt using DALL·E APIs
-        """
+    async def _check_image_gen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.config['enable_image_generation'] or not await self.check_allowed_and_within_budget(update, context):
-            return
+            raise RuntimeError('Image generation is not enabled or user is not allowed to generate images')
 
         chat_id = update.effective_chat.id
         image_query = message_text(update.message)
         if image_query == '':
-            await context.bot.send_message(chat_id=chat_id, text=localized_text('image_no_prompt', self.config['bot_language']))
+            await context.bot.send_message(chat_id=chat_id,
+                                           text=localized_text('image_no_prompt', self.config['bot_language']))
+            raise RuntimeError('No prompt provided for image generation')
+
+        return chat_id, image_query
+
+    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Generates an image for the given prompt using DALL·E APIs
+        """
+        try:
+            chat_id, image_query = await self._check_image_gen(update, context)
+        except RuntimeError as e:
+            logging.warning(e)
             return
 
         logging.info(f'New image generation request received from user {update.message.from_user.name} '
@@ -220,6 +232,33 @@ class ChatGPTTelegramBot:
                 if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
                     self.usage["guests"].add_image_request(image_size, self.config['image_prices'])
 
+            except Exception as e:
+                logging.exception(e)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    reply_to_message_id=self.get_reply_to_message_id(update),
+                    text=f"{localized_text('image_fail', self.config['bot_language'])}: {str(e)}",
+                    parse_mode=constants.ParseMode.MARKDOWN
+                )
+
+        await self.wrap_with_indicator(update, context, constants.ChatAction.UPLOAD_PHOTO, _generate)
+
+    async def stable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            chat_id, image_query = await self._check_image_gen(update, context)
+        except RuntimeError as e:
+            logging.warning(e)
+            return
+
+        async def _generate():
+            try:
+                img_bytes = await self.huggingface.text_to_image(prompt=image_query)
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    reply_to_message_id=self.get_reply_to_message_id(update),
+                    photo=img_bytes
+                )
+                # TODO add to tracker
             except Exception as e:
                 logging.exception(e)
                 await context.bot.send_message(
@@ -796,6 +835,7 @@ class ChatGPTTelegramBot:
         application.add_handler(CommandHandler('reset', self.reset))
         application.add_handler(CommandHandler('help', self.help))
         application.add_handler(CommandHandler('image', self.image))
+        application.add_handler(CommandHandler('stable', self.stable))
         application.add_handler(CommandHandler('start', self.help))
         application.add_handler(CommandHandler('stats', self.stats))
         application.add_handler(CommandHandler('resend', self.resend))
